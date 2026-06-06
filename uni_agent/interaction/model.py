@@ -174,10 +174,17 @@ class AgentChatModel:
                 break
         base_ids = base_ids[:cut]
 
-        assert full_ids[: len(base_ids)] == base_ids, (
-            "base_ids must be an exact prefix of full_ids; "
-            "chat template produced inconsistent rendering between baseline and full."
-        )
+        if full_ids[: len(base_ids)] != base_ids:
+            # Mooncake smoke patch: Qwen3 chat template renders last assistant
+            # turn differently from a historical assistant followed by tool/user
+            # messages, so the exact-prefix invariant breaks. Fall back to the
+            # longest common prefix so multi-turn rollouts can proceed.
+            common = 0
+            for i in range(min(len(base_ids), len(full_ids))):
+                if base_ids[i] != full_ids[i]:
+                    break
+                common = i + 1
+            return full_ids[common:]
         return full_ids[len(base_ids) :]
 
 

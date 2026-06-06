@@ -72,7 +72,34 @@ class AgentInteraction:
             )
             self.logger.debug(f"Model Output:\n{model_output}")
         except MaxTokenExceededError as e:
-            self.logger.error(str(e))
+            # CRITICAL: when this fires on step_idx=1 the rollout_cache
+            # ["response_mask"] is still [] because model.py:95-99 raised
+            # before line 119 could append. That empty mask then hits the
+            # guard in uni_agent/agent_loop.py convert_to_agent_output and
+            # routes to Layer 2 (_make_failed_output). Log step_idx and
+            # response_mask state so we can distinguish step-1 (lethal)
+            # from later steps (benign — already have a partial response).
+            #
+            # LOGURU GOTCHA: loguru re-runs .format() on the final message
+            # string. f-string interpolation of {e} can produce literal '{'
+            # or '}' (e.g. from agent config repr like
+            # "searcher_re: re.compile('{...}')"), making loguru raise
+            # ValueError("Single '}' encountered in format string") inside
+            # the logger call itself. The own-goal cascades: this except
+            # bubbles to Layer 2 _make_failed_output, which also f-strings
+            # the exc, also crashes, then the buildfail fallback also
+            # crashes, killing the Rollouter actor entirely. Use the
+            # `logger.method("{}", precomputed_str)` pattern so the
+            # message template is the literal "{}" (always safe) and the
+            # brace-prone content is a positional arg whose substituted
+            # output is NOT re-parsed by .format().
+            _msg = (
+                f"[step{step_idx}] MaxTokenExceededError: "
+                f"response_mask_len_before={len(self.rollout_cache.get('response_mask', []))} "
+                f"prompt_ids_len={len(self.rollout_cache.get('prompt_ids', []))} "
+                f"detail: {str(e)}"
+            )
+            self.logger.error("{}", _msg)
             step_output.exit_reason = "token_limit"
             step_output.done = True
             return step_output
@@ -95,11 +122,14 @@ class AgentInteraction:
             self.rollout_cache = await self.model.append_messages_to_rollout_cache([user_message], self.rollout_cache)
             step_output.exit_reason = "format_error"
             model_output_preview = "\n".join(model_output.splitlines()[:20])
-            self.logger.error(
+            # LOGURU GOTCHA: model_output is LLM-generated and routinely contains
+            # literal '{' / '}' (JSON, code, dict literals). Use safe "{}" template.
+            _msg = (
                 f"Fail to parse thought and action from model output.\n"
                 f"Error Message: {str(e)}\n"
                 f"Model Output (first 20 lines): {model_output_preview}"
             )
+            self.logger.error("{}", _msg)
             return step_output
 
         # step 4: run action in the environment
@@ -177,6 +207,26 @@ class AgentInteraction:
         rollout_cache = await self.model.prepare_rollout_cache(self.messages)
         self.rollout_cache: dict[str, str] = rollout_cache
 
+        # Baseline snapshot BEFORE step 1: lets us tell at a glance whether a
+        # later "empty response_mask" was caused by the initial prompt+tools
+        # already exceeding max_model_len (headroom<=0 → MaxTokenExceededError
+        # at model.py:95-99 is guaranteed on step 1) versus a generate-time
+        # failure (headroom>0, error must come from client.generate() or later).
+        # Read attributes directly — both are guaranteed set in AgentChatModel:
+        #   max_model_len via __init__ setattr loop (agent_loop.py:359-364)
+        #   tools_schemas via set_tools_schemas() called in
+        #   UniAgentLoop._run_interaction before this method.
+        # If either is ever unset, we want a loud AttributeError, not silent -1/0.
+        _baseline_prompt_len = len(rollout_cache["prompt_ids"])
+        _max_model_len = self.model.max_model_len
+        _headroom = _max_model_len - _baseline_prompt_len
+        _n_tools = len(self.model.tools_schemas) if self.model.tools_schemas else 0
+        self.logger.info(
+            f"[run-start] baseline_prompt_ids_len={_baseline_prompt_len} "
+            f"max_model_len={_max_model_len} headroom={_headroom} "
+            f"n_tools={_n_tools} n_messages={len(self.messages)}"
+        )
+
         done = False
         step_idx = 0
         execution_time = time.perf_counter()
@@ -194,7 +244,18 @@ class AgentInteraction:
                     break
             except Exception as e:
                 # this should not happen, if it happens, we should fix the code
-                self.logger.critical(f"Exit due to unknown error: {str(e)}")
+                # CRITICAL: on step_idx=1 this leaves response_mask=[] which then
+                # triggers the convert_to_agent_output guard (→ _make_failed_output).
+                # Log type + state so we can tell what raised (Modal swerex timeout,
+                # tokenizer corruption, PyPI mirror flake, …).
+                # See loguru gotcha comment on the MaxTokenExceededError handler
+                # above — same brace-in-exc-repr crash applies here.
+                _msg = (
+                    f"[step{step_idx}] unknown_error: {type(e).__name__}: {e} "
+                    f"response_mask_len_before={len(self.rollout_cache.get('response_mask', []))} "
+                    f"prompt_ids_len={len(self.rollout_cache.get('prompt_ids', []))}"
+                )
+                self.logger.opt(exception=True).critical("{}", _msg)
                 step_output = StepOutput(step_idx=step_idx, exit_reason="unknown_error")
                 self.trajectory.append(step_output)
                 break
