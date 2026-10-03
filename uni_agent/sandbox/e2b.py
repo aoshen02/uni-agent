@@ -21,6 +21,17 @@ logger = logging.getLogger(__name__)
 
 _TEMPLATE_BUILD_LOCKS: defaultdict[str, threading.Lock] = defaultdict(threading.Lock)
 
+# E2B starts each command's shell with the image's environment, but the login
+# shell's /etc/profile then resets PATH to the distribution default, hiding
+# toolchains the image put on PATH (e.g. /usr/local/go/bin). Restore the PATH
+# the shell was started with.
+_RESTORE_IMAGE_PATH = (
+    "_p=$(tr '\\0' '\\n' < /proc/$$/environ 2>/dev/null | sed -n 's/^PATH=//p')\n"
+    '[ -n "$_p" ] && export PATH="$_p"\n'
+    "unset _p\n"
+)
+_RESTORE_IMAGE_PATH_FILE = "/etc/profile.d/zz-uni-agent-image-path.sh"
+
 
 def _ensure_template(image: str, cpu_count: int, memory_mb: int) -> str:
     """Build the image-backed template once and return its deterministic name."""
@@ -138,6 +149,12 @@ class E2BSandbox(Sandbox):
         sandbox = await AsyncSandbox.create(**create_kwargs)
         self._sandbox = sandbox
         self.sandbox_id = str(sandbox.sandbox_id)
+        await sandbox.files.write(
+            _RESTORE_IMAGE_PATH_FILE,
+            _RESTORE_IMAGE_PATH,
+            user="root",
+            request_timeout=self.file_request_timeout,
+        )
 
     async def stop(self) -> None:
         sandbox, self._sandbox = self._sandbox, None
