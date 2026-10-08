@@ -32,14 +32,20 @@ _RESTORE_IMAGE_PATH = (
 )
 _RESTORE_IMAGE_PATH_FILE = "/etc/profile.d/zz-uni-agent-image-path.sh"
 
-# A provider at capacity (503 "no capacity available") is not a failed start:
-# wait for capacity, up to E2B_CAPACITY_WAIT seconds, instead of dropping the
-# episode. Raise SANDBOX_STARTUP_TIMEOUT above this when it is raised.
+# A provider at capacity (503 "no capacity available") or briefly failing
+# (500/502/504, or an error body the SDK cannot parse) is not a failed start:
+# wait, up to E2B_CAPACITY_WAIT seconds, instead of dropping the episode.
+# Raise SANDBOX_STARTUP_TIMEOUT above this when it is raised.
 _DEFAULT_CAPACITY_WAIT = 1800.0
+_TRANSIENT_STATUS = re.compile(r"^(500|502|503|504):")
 
 
-def _is_capacity_error(exc: BaseException) -> bool:
-    return type(exc).__name__ == "ServiceBusyException" or "no capacity" in str(exc).lower()
+def _is_transient_provider_error(exc: BaseException) -> bool:
+    if type(exc).__name__ == "ServiceBusyException" or "no capacity" in str(exc).lower():
+        return True
+    if isinstance(exc, KeyError) and exc.args == ("code",):
+        return True
+    return type(exc).__module__.startswith("e2b") and bool(_TRANSIENT_STATUS.match(str(exc)))
 
 
 def _ensure_template(image: str, cpu_count: int, memory_mb: int) -> str:
@@ -132,15 +138,30 @@ class E2BSandbox(Sandbox):
 
         from e2b import AsyncSandbox
 
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _env_number("E2B_CAPACITY_WAIT", _DEFAULT_CAPACITY_WAIT)
+        delay = 5.0
+
+        async def backoff(exc: Exception) -> None:
+            nonlocal delay
+            if not _is_transient_provider_error(exc) or loop.time() + delay > deadline:
+                raise exc
+            logger.info("E2B unavailable, retrying in %.0fs: %r", delay, exc)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 60.0)
+
         template = self.template
-        if template is None:
+        while template is None:
             assert self.image is not None
-            template = await asyncio.to_thread(
-                _ensure_template,
-                self.image,
-                self.cpu_count,
-                self.memory_mb,
-            )
+            try:
+                template = await asyncio.to_thread(
+                    _ensure_template,
+                    self.image,
+                    self.cpu_count,
+                    self.memory_mb,
+                )
+            except Exception as exc:
+                await backoff(exc)
 
         create_kwargs: dict[str, Any] = {
             "template": template,
@@ -155,19 +176,12 @@ class E2BSandbox(Sandbox):
         if self.lifecycle is not None:
             create_kwargs["lifecycle"] = self.lifecycle
 
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + _env_number("E2B_CAPACITY_WAIT", _DEFAULT_CAPACITY_WAIT)
-        delay = 5.0
         while True:
             try:
                 sandbox = await AsyncSandbox.create(**create_kwargs)
                 break
             except Exception as exc:
-                if not _is_capacity_error(exc) or loop.time() + delay > deadline:
-                    raise
-                logger.info("E2B at capacity, retrying sandbox create in %.0fs: %s", delay, exc)
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, 60.0)
+                await backoff(exc)
         self._sandbox = sandbox
         self.sandbox_id = str(sandbox.sandbox_id)
         await sandbox.files.write(
