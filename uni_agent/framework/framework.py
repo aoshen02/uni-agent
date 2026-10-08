@@ -337,6 +337,7 @@ class GatewayAgentFramework(AgentFramework):
         rollout_config=None,
         log_dir: str | None = None,
         mask_unfinished_episode: bool = False,
+        max_failed_prompt_fraction: float = 1.0,
         trajectory_postprocessor: TrajectoryPostprocessor | None = None,
         trajectory_postprocessor_kwargs: dict[str, object] | None = None,
     ):
@@ -359,6 +360,7 @@ class GatewayAgentFramework(AgentFramework):
         self._semaphore_loop: asyncio.AbstractEventLoop | None = None
         self._log_dir = log_dir
         self._mask_unfinished_episode = mask_unfinished_episode
+        self._max_failed_prompt_fraction = max_failed_prompt_fraction
         self._trajectory_postprocessor = trajectory_postprocessor
         self._trajectory_postprocessor_kwargs = trajectory_postprocessor_kwargs or {}
 
@@ -407,6 +409,12 @@ class GatewayAgentFramework(AgentFramework):
         if type(mask_unfinished_episode) is not bool:
             raise ValueError("actor_rollout_ref.rollout.custom.agent_framework.mask_unfinished_episode must be a bool")
 
+        max_failed_prompt_fraction = float(af_cfg.get("max_failed_prompt_fraction", 1.0))
+        if not 0.0 <= max_failed_prompt_fraction <= 1.0:
+            raise ValueError(
+                "actor_rollout_ref.rollout.custom.agent_framework.max_failed_prompt_fraction must be in [0, 1]"
+            )
+
         postprocessor_fqn = af_cfg.get("trajectory_postprocessor_fqn")
         postprocessor_kwargs = af_cfg.get("trajectory_postprocessor_kwargs")
         if postprocessor_kwargs is None:
@@ -442,6 +450,7 @@ class GatewayAgentFramework(AgentFramework):
             rollout_config=config.actor_rollout_ref.rollout,
             log_dir=log_dir,
             mask_unfinished_episode=mask_unfinished_episode,
+            max_failed_prompt_fraction=max_failed_prompt_fraction,
             trajectory_postprocessor=trajectory_postprocessor,
             trajectory_postprocessor_kwargs=trajectory_postprocessor_kwargs,
         )
@@ -547,6 +556,15 @@ class GatewayAgentFramework(AgentFramework):
             raise RuntimeError(
                 f"All rollouts failed at global_steps={global_steps}. "
                 f"failures={stats['num_failed_uids']}/{stats['num_input_prompts']}"
+            )
+        # Failed prompts are dropped from the batch; past this fraction the step
+        # would silently train on a different batch than configured.
+        if stats["num_failed_uids"] > self._max_failed_prompt_fraction * stats["num_input_prompts"]:
+            raise RuntimeError(
+                f"Too many failed prompts at global_steps={global_steps}: "
+                f"{stats['num_failed_uids']}/{stats['num_input_prompts']} > "
+                f"max_failed_prompt_fraction={self._max_failed_prompt_fraction}; "
+                f"reasons={stats['failure_reasons'][:3]}"
             )
         return None
 
