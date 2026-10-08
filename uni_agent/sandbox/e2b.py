@@ -37,6 +37,7 @@ _RESTORE_IMAGE_PATH_FILE = "/etc/profile.d/zz-uni-agent-image-path.sh"
 # wait, up to E2B_CAPACITY_WAIT seconds, instead of dropping the episode.
 # Raise SANDBOX_STARTUP_TIMEOUT above this when it is raised.
 _DEFAULT_CAPACITY_WAIT = 1800.0
+_DEFAULT_EXEC_HARD_TIMEOUT = 7200.0
 _TRANSIENT_STATUS = re.compile(r"^(500|502|503|504):")
 
 
@@ -240,8 +241,11 @@ class E2BSandbox(Sandbox):
             envs=env,
             cwd=workdir,
         )
+        # A sandbox that becomes unreachable can leave wait() hanging forever;
+        # bound it past the command's own timeout.
+        hard_timeout = command_timeout + 60 if command_timeout else _DEFAULT_EXEC_HARD_TIMEOUT
         try:
-            result = await handle.wait()
+            result = await asyncio.wait_for(handle.wait(), timeout=hard_timeout)
         except CommandExitException as exc:
             return ExecResult(
                 exit_code=int(exc.exit_code),
