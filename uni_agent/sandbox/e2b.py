@@ -11,7 +11,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .base import ExecResult, Sandbox, _to_str
+from .base import ExecResult, Sandbox, _env_number, _to_str
 from .registry import register_sandbox
 
 if TYPE_CHECKING:
@@ -31,6 +31,15 @@ _RESTORE_IMAGE_PATH = (
     "unset _p\n"
 )
 _RESTORE_IMAGE_PATH_FILE = "/etc/profile.d/zz-uni-agent-image-path.sh"
+
+# A provider at capacity (503 "no capacity available") is not a failed start:
+# wait for capacity, up to E2B_CAPACITY_WAIT seconds, instead of dropping the
+# episode. Raise SANDBOX_STARTUP_TIMEOUT above this when it is raised.
+_DEFAULT_CAPACITY_WAIT = 1800.0
+
+
+def _is_capacity_error(exc: BaseException) -> bool:
+    return type(exc).__name__ == "ServiceBusyException" or "no capacity" in str(exc).lower()
 
 
 def _ensure_template(image: str, cpu_count: int, memory_mb: int) -> str:
@@ -146,7 +155,19 @@ class E2BSandbox(Sandbox):
         if self.lifecycle is not None:
             create_kwargs["lifecycle"] = self.lifecycle
 
-        sandbox = await AsyncSandbox.create(**create_kwargs)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _env_number("E2B_CAPACITY_WAIT", _DEFAULT_CAPACITY_WAIT)
+        delay = 5.0
+        while True:
+            try:
+                sandbox = await AsyncSandbox.create(**create_kwargs)
+                break
+            except Exception as exc:
+                if not _is_capacity_error(exc) or loop.time() + delay > deadline:
+                    raise
+                logger.info("E2B at capacity, retrying sandbox create in %.0fs: %s", delay, exc)
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 60.0)
         self._sandbox = sandbox
         self.sandbox_id = str(sandbox.sandbox_id)
         await sandbox.files.write(
