@@ -41,6 +41,17 @@ def _grade(metadata: dict[str, Any], output: Any) -> dict[str, Any]:
     }
 
 
+def _effective_eval_timeout(metadata: dict[str, Any], eval_timeout: float) -> float:
+    """Tighten ``eval_timeout`` to the instance's calibrated ``eval_timeout_s``, if any."""
+    instance_timeout = metadata.get("eval_timeout_s")
+    if instance_timeout is None:
+        return eval_timeout
+    instance_timeout = float(instance_timeout)
+    if not instance_timeout > 0:
+        raise ValueError(f"eval_timeout_s must be positive, got {instance_timeout!r}")
+    return min(eval_timeout, instance_timeout)
+
+
 def _selected_test_args(value: object) -> list[str]:
     if isinstance(value, str):
         return [value] if value else []
@@ -97,9 +108,12 @@ async def compute_reward(
     With ``raise_on_infra_error``, an eval that could not run (sandbox
     unreachable, hung command stream, output unreadable) raises
     :class:`EvalInfraError` instead of scoring 0. Test failures and the eval
-    hitting ``eval_timeout`` still score 0.
+    hitting ``eval_timeout`` still score 0. An instance's optional
+    ``eval_timeout_s`` metadata (calibrated from its gold-patch eval time)
+    lowers ``eval_timeout`` so a patch that hangs the tests fails fast.
     """
     instance_id = metadata["instance_id"]
+    eval_timeout = _effective_eval_timeout(metadata, eval_timeout)
     selected_tests = _selected_test_args(metadata["selected_test_files_to_run"])
 
     workspace = f"/tmp/swe_bench_pro_eval_{uuid.uuid4().hex}"
@@ -140,6 +154,7 @@ async def compute_reward(
     result: dict[str, Any] = {
         "eval_completed": False,
         "eval_execution_time": execution_time,
+        "eval_timeout": eval_timeout,
         "eval_report": {
             "resolved": False,
             "found_eval_status": False,

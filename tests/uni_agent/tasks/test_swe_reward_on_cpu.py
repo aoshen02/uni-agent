@@ -157,3 +157,33 @@ async def test_swe_pro_policy_failures_still_score_zero(eval_result, eval_timeou
         raise_on_infra_error=True,
     )
     assert result["resolved"] is False
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("instance_timeout", "expected"),
+    [
+        pytest.param(None, 900.0, id="no-calibration"),
+        pytest.param(180.0, 180.0, id="calibrated-tighter"),
+        pytest.param(5000.0, 900.0, id="never-above-global"),
+    ],
+)
+async def test_swe_pro_instance_eval_timeout_caps_global(instance_timeout, expected):
+    """A calibrated per-instance eval_timeout_s cuts patch-induced hangs short but never extends the global cap."""
+    from uni_agent.tasks.swe_bench_pro import reward as pro_reward
+
+    metadata = dict(PRO_METADATA, eval_timeout_s=instance_timeout)
+    sandbox = _pro_sandbox(ExecResult(0, "", ""), output={"tests": [{"name": "test_fix", "status": "PASSED"}]})
+    seen = {}
+
+    async def exec_shell(*args, **kwargs):
+        seen.update(kwargs)
+        return ExecResult(0, "", "")
+
+    sandbox.exec_shell = exec_shell
+    result = await pro_reward.compute_reward(metadata, sandbox, eval_timeout=900.0)
+    assert seen["timeout"] == expected
+    assert result["eval_timeout"] == expected
+    assert result["resolved"] is True
