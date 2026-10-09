@@ -11,7 +11,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .base import ExecResult, Sandbox, _env_number, _to_str
+from .base import ExecResult, Sandbox, SandboxChannelError, _env_number, _to_str
 from .registry import register_sandbox
 
 if TYPE_CHECKING:
@@ -32,17 +32,21 @@ _RESTORE_IMAGE_PATH = (
 )
 _RESTORE_IMAGE_PATH_FILE = "/etc/profile.d/zz-uni-agent-image-path.sh"
 
-# A provider at capacity (503 "no capacity available") or briefly failing
-# (500/502/504, or an error body the SDK cannot parse) is not a failed start:
+# A provider at capacity (503 "no capacity available"), rate limiting (429), or
+# briefly failing (500/502/504, or an error body the SDK cannot parse) is not a failed start:
 # wait, up to E2B_CAPACITY_WAIT seconds, instead of dropping the episode.
 # Raise SANDBOX_STARTUP_TIMEOUT above this when it is raised.
 _DEFAULT_CAPACITY_WAIT = 1800.0
-_DEFAULT_EXEC_HARD_TIMEOUT = 7200.0
-_TRANSIENT_STATUS = re.compile(r"^(500|502|503|504):")
+# Bound on commands run without a timeout (tmux bookkeeping, file probes), which
+# are expected to return in seconds; override with E2B_EXEC_HARD_TIMEOUT.
+_DEFAULT_EXEC_HARD_TIMEOUT = 600.0
+_EXEC_HARD_TIMEOUT_GRACE = 60.0
+_TRANSIENT_STATUS = re.compile(r"^(429|500|502|503|504):")
+_TRANSIENT_EXCEPTIONS = frozenset({"ServiceBusyException", "RateLimitException"})
 
 
 def _is_transient_provider_error(exc: BaseException) -> bool:
-    if type(exc).__name__ == "ServiceBusyException" or "no capacity" in str(exc).lower():
+    if type(exc).__name__ in _TRANSIENT_EXCEPTIONS or "no capacity" in str(exc).lower():
         return True
     if isinstance(exc, KeyError) and exc.args == ("code",):
         return True
@@ -242,10 +246,23 @@ class E2BSandbox(Sandbox):
             cwd=workdir,
         )
         # A sandbox that becomes unreachable can leave wait() hanging forever;
-        # bound it past the command's own timeout.
-        hard_timeout = command_timeout + 60 if command_timeout else _DEFAULT_EXEC_HARD_TIMEOUT
+        # bound it past the command's own timeout. Hitting this bound is a broken
+        # channel, not a command timeout, so it raises SandboxChannelError.
+        # asyncio.wait (not wait_for) keeps a TimeoutError raised by wait()
+        # itself distinguishable from this bound.
+        if command_timeout:
+            hard_timeout = command_timeout + _EXEC_HARD_TIMEOUT_GRACE
+        else:
+            hard_timeout = _env_number("E2B_EXEC_HARD_TIMEOUT", _DEFAULT_EXEC_HARD_TIMEOUT)
+        wait_task = asyncio.ensure_future(handle.wait())
         try:
-            result = await asyncio.wait_for(handle.wait(), timeout=hard_timeout)
+            done, _ = await asyncio.wait({wait_task}, timeout=hard_timeout if hard_timeout > 0 else None)
+            if not done:
+                raise SandboxChannelError(
+                    f"E2B command stream in sandbox {self.sandbox_id} returned nothing for {hard_timeout:g}s "
+                    f"(command timeout {command_timeout:g}s)"
+                )
+            result = wait_task.result()
         except CommandExitException as exc:
             return ExecResult(
                 exit_code=int(exc.exit_code),
@@ -253,6 +270,7 @@ class E2BSandbox(Sandbox):
                 stderr=_to_str(exc.stderr),
             )
         except BaseException:
+            wait_task.cancel()
             try:
                 await asyncio.shield(handle.kill())
             except Exception:
