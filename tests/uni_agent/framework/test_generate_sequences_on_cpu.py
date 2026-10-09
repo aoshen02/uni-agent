@@ -131,12 +131,14 @@ async def _build_framework_with_agent_runners(
     trajectory_postprocessor_fqn: str | None = None,
     trajectory_postprocessor_kwargs: object | None = None,
     reward_config: dict[str, object] | None = None,
+    **agent_framework_overrides: object,
 ):
     from omegaconf import OmegaConf
 
     agent_framework_cfg: dict[str, object] = {
         "agent_runners": agent_runners,
         "mask_unfinished_episode": mask_unfinished_episode,
+        **agent_framework_overrides,
     }
     if log_dir is not None:
         agent_framework_cfg["log_dir"] = log_dir
@@ -1884,6 +1886,97 @@ async def test_generate_sequences_keeps_other_prompts_when_one_prompt_fails(fake
     assert len(runtime.aborted_sessions) == 1
     assert runtime.aborted_sessions[0].startswith("session-sample-0-rollout-0-")
     assert all(session_id.startswith("session-sample-1-rollout-0-") for session_id in runtime.finalized_sessions)
+
+
+def _runner_failing_sessions(failing: set[tuple[int, int]]):
+    async def agent_runner(*, session, sample_index, **kwargs):
+        if any(session.session_id.startswith(f"session-sample-{s}-rollout-{r}-") for s, r in failing):
+            raise RuntimeError("sandbox unreachable")
+        return TaskResult()
+
+    return agent_runner
+
+
+def _all_sessions_runtime(num_prompts: int, n: int) -> _FakeGatewayManager:
+    return _FakeGatewayManager(
+        {f"session-sample-{s}-rollout-{r}-": [_trajectory()] for s in range(num_prompts) for r in range(n)}
+    )
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_generate_sequences_drops_groups_below_min_group_size(fake_tq):
+    """A group that lost too many sessions is not written, so GRPO never sees a
+    tiny, failure-biased group; it counts as a failed prompt."""
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _inline_runner_config(_runner_failing_sessions({(0, 0), (0, 1)}))},
+        gateway_manager=_all_sessions_runtime(num_prompts=2, n=4),
+        n=4,
+        min_group_size=3,
+        max_failed_prompt_fraction=0.5,
+    )
+
+    await framework.generate_sequences(_build_prompts(count=2, global_steps=12))
+
+    assert sorted(key for put in fake_tq.batch_puts for key in put["keys"]) == [f"uid-1_{r}_0" for r in range(4)]
+    assert {put["key"]: put["tag"]["status"] for put in fake_tq.puts} == {"uid-0": "failure", "uid-1": "finished"}
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_dropped_groups_count_against_max_failed_prompt_fraction(fake_tq):
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _inline_runner_config(_runner_failing_sessions({(0, 0)}))},
+        gateway_manager=_all_sessions_runtime(num_prompts=2, n=2),
+        n=2,
+        min_group_size=2,
+        max_failed_prompt_fraction=0.25,
+    )
+
+    with pytest.raises(RuntimeError, match="Too many failed prompts"):
+        await framework.generate_sequences(_build_prompts(count=2, global_steps=13))
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("max_failed_session_fraction", "raises"), [(0.25, True), (1.0, False)])
+async def test_partial_session_loss_trips_max_failed_session_fraction(fake_tq, max_failed_session_fraction, raises):
+    """Losing 3 of 4 sessions in every group keeps every prompt alive, so only the
+    session-level guard catches it."""
+    failing = {(s, r) for s in range(2) for r in range(1, 4)}
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _inline_runner_config(_runner_failing_sessions(failing))},
+        gateway_manager=_all_sessions_runtime(num_prompts=2, n=4),
+        n=4,
+        max_failed_prompt_fraction=0.0,
+        max_failed_session_fraction=max_failed_session_fraction,
+    )
+
+    if raises:
+        with pytest.raises(RuntimeError, match=r"Too many failed sessions at global_steps=14: 6/8"):
+            await framework.generate_sequences(_build_prompts(count=2, global_steps=14))
+    else:
+        await framework.generate_sequences(_build_prompts(count=2, global_steps=14))
+        assert len(fake_tq.batch_puts) == 2
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "overrides",
+    [{"min_group_size": 0}, {"min_group_size": 1.5}, {"max_failed_session_fraction": 1.5}],
+)
+async def test_framework_rejects_invalid_group_guards(overrides):
+    with pytest.raises(ValueError):
+        await _build_framework_with_agent_runners(
+            agent_runners={"runner": _inline_runner_config(_async_noop_runner)},
+            gateway_manager=_FakeGatewayManager({}),
+            **overrides,
+        )
 
 
 # ---------------------------------------------------------------------------

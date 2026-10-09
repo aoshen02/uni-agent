@@ -338,6 +338,8 @@ class GatewayAgentFramework(AgentFramework):
         log_dir: str | None = None,
         mask_unfinished_episode: bool = False,
         max_failed_prompt_fraction: float = 1.0,
+        max_failed_session_fraction: float = 1.0,
+        min_group_size: int = 1,
         trajectory_postprocessor: TrajectoryPostprocessor | None = None,
         trajectory_postprocessor_kwargs: dict[str, object] | None = None,
     ):
@@ -361,6 +363,8 @@ class GatewayAgentFramework(AgentFramework):
         self._log_dir = log_dir
         self._mask_unfinished_episode = mask_unfinished_episode
         self._max_failed_prompt_fraction = max_failed_prompt_fraction
+        self._max_failed_session_fraction = max_failed_session_fraction
+        self._min_group_size = min_group_size
         self._trajectory_postprocessor = trajectory_postprocessor
         self._trajectory_postprocessor_kwargs = trajectory_postprocessor_kwargs or {}
 
@@ -414,6 +418,16 @@ class GatewayAgentFramework(AgentFramework):
             raise ValueError(
                 "actor_rollout_ref.rollout.custom.agent_framework.max_failed_prompt_fraction must be in [0, 1]"
             )
+        max_failed_session_fraction = float(af_cfg.get("max_failed_session_fraction", 1.0))
+        if not 0.0 <= max_failed_session_fraction <= 1.0:
+            raise ValueError(
+                "actor_rollout_ref.rollout.custom.agent_framework.max_failed_session_fraction must be in [0, 1]"
+            )
+        min_group_size = af_cfg.get("min_group_size", 1)
+        if type(min_group_size) is not int or min_group_size < 1:
+            raise ValueError(
+                "actor_rollout_ref.rollout.custom.agent_framework.min_group_size must be a positive integer"
+            )
 
         postprocessor_fqn = af_cfg.get("trajectory_postprocessor_fqn")
         postprocessor_kwargs = af_cfg.get("trajectory_postprocessor_kwargs")
@@ -451,6 +465,8 @@ class GatewayAgentFramework(AgentFramework):
             log_dir=log_dir,
             mask_unfinished_episode=mask_unfinished_episode,
             max_failed_prompt_fraction=max_failed_prompt_fraction,
+            max_failed_session_fraction=max_failed_session_fraction,
+            min_group_size=min_group_size,
             trajectory_postprocessor=trajectory_postprocessor,
             trajectory_postprocessor_kwargs=trajectory_postprocessor_kwargs,
         )
@@ -543,13 +559,15 @@ class GatewayAgentFramework(AgentFramework):
         logger.info(
             "generate_sequences summary: num_input_prompts=%s num_success_sessions=%s "
             "num_failed_sessions=%s num_success_outputs=%s num_unfinished_episodes=%s "
-            "num_failed_uids=%s failure_reasons=%s",
+            "num_failed_uids=%s num_dropped_uids=%s num_dropped_sessions=%s failure_reasons=%s",
             stats["num_input_prompts"],
             stats["num_success_sessions"],
             stats["num_failed_sessions"],
             stats["num_success_outputs"],
             stats["num_unfinished_episodes"],
             stats["num_failed_uids"],
+            stats["num_dropped_uids"],
+            stats["num_dropped_sessions"],
             stats["failure_reasons"][:3],
         )
         if stats["num_success_outputs"] == 0:
@@ -564,6 +582,16 @@ class GatewayAgentFramework(AgentFramework):
                 f"Too many failed prompts at global_steps={global_steps}: "
                 f"{stats['num_failed_uids']}/{stats['num_input_prompts']} > "
                 f"max_failed_prompt_fraction={self._max_failed_prompt_fraction}; "
+                f"reasons={stats['failure_reasons'][:3]}"
+            )
+        # Partial session loss keeps every prompt alive but shrinks groups, which
+        # the prompt guard above cannot see.
+        num_planned_sessions = stats["num_input_prompts"] * num_sessions
+        if stats["num_failed_sessions"] > self._max_failed_session_fraction * num_planned_sessions:
+            raise RuntimeError(
+                f"Too many failed sessions at global_steps={global_steps}: "
+                f"{stats['num_failed_sessions']}/{num_planned_sessions} > "
+                f"max_failed_session_fraction={self._max_failed_session_fraction}; "
                 f"reasons={stats['failure_reasons'][:3]}"
             )
         return None
@@ -604,6 +632,8 @@ class GatewayAgentFramework(AgentFramework):
             "num_success_outputs": 0,
             "num_unfinished_episodes": 0,
             "num_failed_uids": 0,
+            "num_dropped_uids": 0,
+            "num_dropped_sessions": 0,
             "failure_reasons": failure_reasons,
         }
         for outcome in outcomes:
@@ -621,6 +651,8 @@ class GatewayAgentFramework(AgentFramework):
             stats["num_success_outputs"] += outcome["num_success_outputs"]
             stats["num_unfinished_episodes"] += outcome["num_unfinished_episodes"]
             stats["num_failed_uids"] += outcome["num_failed_uids"]
+            stats["num_dropped_uids"] += outcome["num_dropped_uids"]
+            stats["num_dropped_sessions"] += outcome["num_dropped_sessions"]
             failure_reasons.extend(outcome["failure_reasons"])
         return stats
 
@@ -663,6 +695,7 @@ class GatewayAgentFramework(AgentFramework):
         success_outputs = 0
         unfinished_episodes = 0
         failure_reasons: list[str] = []
+        completed: list[tuple[int, list[Trajectory], dict[str, object]]] = []
         for session_index, outcome in enumerate(outcomes):
             if isinstance(outcome, Exception):
                 failed_sessions += 1
@@ -678,7 +711,23 @@ class GatewayAgentFramework(AgentFramework):
                 failed_sessions += 1
                 failure_reasons.append(f"empty trajectories for uid={uid} session_index={session_index}")
                 continue
+            completed.append((session_index, trajectories, session_sample_fields))
 
+        # A group shrunk by failures gives GRPO a high-variance baseline that is
+        # biased toward whatever outcome survives failures; drop it instead.
+        min_group_size = min(self._min_group_size, num_sessions) if partition_id == "train" else 1
+        dropped_sessions = 0
+        if 0 < len(completed) < min_group_size:
+            dropped_sessions = len(completed)
+            reason = (
+                f"group uid={uid} dropped: {len(completed)}/{num_sessions} sessions survived "
+                f"< min_group_size={min_group_size}"
+            )
+            logger.warning(reason)
+            failure_reasons.append(reason)
+            completed = []
+
+        for session_index, trajectories, session_sample_fields in completed:
             try:
                 await self._write_session_trajectories_to_tq(
                     uid=uid,
@@ -713,6 +762,8 @@ class GatewayAgentFramework(AgentFramework):
             "num_success_outputs": success_outputs,
             "num_unfinished_episodes": unfinished_episodes,
             "num_failed_uids": failed_uids,
+            "num_dropped_uids": int(dropped_sessions > 0),
+            "num_dropped_sessions": dropped_sessions,
             "failure_reasons": failure_reasons,
         }
 
