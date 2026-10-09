@@ -2154,6 +2154,56 @@ async def test_ray_task_termination_cancels_runner_and_aborts_session(monkeypatc
 @pytest.mark.cpu
 @pytest.mark.level0
 @pytest.mark.asyncio
+@pytest.mark.parametrize("hang_in", ["runner", "finalize", "finalize_and_abort"])
+async def test_session_timeout_fails_only_the_hung_session(fake_tq, hang_in):
+    """A session hung anywhere (runner, Gateway finalize, even its own abort) is
+    failed by session_timeout_seconds; its group-mates still reach TQ and the
+    step returns instead of waiting on the hung session forever."""
+    hung_prefix = "session-sample-0-rollout-1-"
+
+    class _GatewayManager(_FakeGatewayManager):
+        async def finalize_session(self, session_id: str):
+            if hang_in != "runner" and session_id.startswith(hung_prefix):
+                await asyncio.Event().wait()
+            return await super().finalize_session(session_id)
+
+        async def abort_session(self, session_id: str) -> None:
+            await super().abort_session(session_id)
+            if hang_in == "finalize_and_abort":
+                await asyncio.Event().wait()
+
+    async def agent_runner(*, session, **kwargs):
+        if hang_in == "runner" and session.session_id.startswith(hung_prefix):
+            await asyncio.Event().wait()
+        return TaskResult()
+
+    runtime = _GatewayManager(
+        {
+            "session-sample-0-rollout-0": [_trajectory()],
+            "session-sample-0-rollout-1": [_trajectory()],
+        }
+    )
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": {**_inline_runner_config(agent_runner), "session_timeout_seconds": 0.2}},
+        gateway_manager=runtime,
+        n=2,
+    )
+    framework._SESSION_ABORT_TIMEOUT_SECONDS = 0.1
+
+    stats = await asyncio.wait_for(
+        framework._run_batch_rollouts(_build_prompts(count=1), global_steps=7, partition_id="train", num_sessions=2),
+        timeout=5,
+    )
+
+    assert (stats["num_success_sessions"], stats["num_failed_sessions"]) == (1, 1)
+    assert "session_timeout_seconds=0.2" in stats["failure_reasons"][0]
+    assert fake_tq.batch_puts[0]["keys"] == ["uid-0_0_0"]
+    assert [s[: len(hung_prefix)] for s in runtime.aborted_sessions] == [hung_prefix]
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
 @pytest.mark.parametrize("validate,mask_unfinished", [(False, True), (True, False)])
 async def test_runner_reward_context_survives_tq_without_changing_training_fields(fake_tq, validate, mask_unfinished):
     context = {

@@ -109,7 +109,9 @@ def _log_scope(log_context: LogContext | None):
     return sample_logging.from_context(log_context)
 
 
-@ray.remote
+# No Ray-level retries: a retry would replay the runner against the same, already
+# partially-used Gateway session. A crashed runner is a failed session.
+@ray.remote(max_retries=0)
 def _run_agent_runner_ray_task(
     *,
     runner_fqn: str,
@@ -325,6 +327,11 @@ class GatewayAgentFramework(AgentFramework):
     #: ray.cancel (letting its sandbox context manager tear down) before the
     #: framework escalates to a force-kill.
     _RUNNER_CANCEL_GRACE_SECONDS = 30.0
+    #: Bound on a Gateway ``abort_session`` call made while failing a session.
+    _SESSION_ABORT_TIMEOUT_SECONDS = 60.0
+    #: How long a timed-out session may spend unwinding (runner cancel, Gateway
+    #: abort) before the framework stops waiting for it.
+    _SESSION_CLEANUP_GRACE_SECONDS = 120.0
 
     def __init__(
         self,
@@ -367,6 +374,13 @@ class GatewayAgentFramework(AgentFramework):
         self._min_group_size = min_group_size
         self._trajectory_postprocessor = trajectory_postprocessor
         self._trajectory_postprocessor_kwargs = trajectory_postprocessor_kwargs or {}
+        for runner_name, runner_config in runner_registry.items():
+            if runner_config.session_timeout_seconds is None:
+                logger.warning(
+                    "agent_runners.%s.session_timeout_seconds is unset: one hung session can stall "
+                    "the whole rollout step",
+                    runner_name,
+                )
 
     @classmethod
     def from_config(
@@ -800,7 +814,7 @@ class GatewayAgentFramework(AgentFramework):
 
         runner_cap = runner_config.max_concurrent_sessions
         if runner_cap <= 0:
-            return await self._run_agent_episode(
+            return await self._run_agent_episode_with_deadline(
                 sample_fields=sample_fields,
                 sample_index=sample_index,
                 session_index=session_index,
@@ -816,7 +830,7 @@ class GatewayAgentFramework(AgentFramework):
             self._runner_semaphores[runner_name] = runner_semaphore
 
         async with runner_semaphore:
-            return await self._run_agent_episode(
+            return await self._run_agent_episode_with_deadline(
                 sample_fields=sample_fields,
                 sample_index=sample_index,
                 session_index=session_index,
@@ -825,6 +839,63 @@ class GatewayAgentFramework(AgentFramework):
                 runner_config=runner_config,
                 sampling_params=sampling_params,
             )
+
+    async def _run_agent_episode_with_deadline(
+        self,
+        *,
+        runner_config: _RunnerConfig,
+        **episode_kwargs,
+    ) -> tuple[list[Trajectory], dict[str, object]]:
+        """Bound the whole session (runner, finalize, scoring) by ``session_timeout_seconds``.
+
+        The deadline covers every await of the session, not just the runner, so a
+        hang anywhere fails only this session. A timed-out session raises
+        ``TimeoutError`` and is counted as a failed session by the group/batch
+        guards. Its cleanup is itself bounded: if it does not unwind within
+        ``_SESSION_CLEANUP_GRACE_SECONDS`` it is abandoned rather than awaited.
+        """
+        timeout = runner_config.session_timeout_seconds
+        episode = self._run_agent_episode(runner_config=runner_config, **episode_kwargs)
+        if timeout is None:
+            return await episode
+
+        task = asyncio.ensure_future(episode)
+        # An abandoned task may still fail later; retrieve it so asyncio does
+        # not log "exception was never retrieved".
+        task.add_done_callback(lambda t: t.cancelled() or t.exception())
+        try:
+            done, _ = await asyncio.wait({task}, timeout=timeout)
+        except asyncio.CancelledError:
+            task.cancel()
+            await asyncio.wait({task}, timeout=self._SESSION_CLEANUP_GRACE_SECONDS)
+            raise
+        if done:
+            return task.result()
+
+        task.cancel()
+        done, _ = await asyncio.wait({task}, timeout=self._SESSION_CLEANUP_GRACE_SECONDS)
+        if not done:
+            logger.error(
+                "session (sample_index=%s session_index=%s) did not unwind within %ss after timing out; abandoning it",
+                episode_kwargs.get("sample_index"),
+                episode_kwargs.get("session_index"),
+                self._SESSION_CLEANUP_GRACE_SECONDS,
+            )
+        raise TimeoutError(f"session exceeded session_timeout_seconds={timeout:g}")
+
+    async def _abort_session(self, session_id: str) -> None:
+        """Abort a Gateway session without letting a hung or failing abort mask the session error."""
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(self.gateway_manager.abort_session(session_id)),
+                timeout=self._SESSION_ABORT_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "session %s: Gateway abort timed out after %ss", session_id, self._SESSION_ABORT_TIMEOUT_SECONDS
+            )
+        except Exception:
+            logger.exception("session %s: Gateway abort failed", session_id)
 
     async def _run_agent_episode(
         self,
@@ -891,21 +962,15 @@ class GatewayAgentFramework(AgentFramework):
                         tools_kwargs=tools_kwargs,
                         log_context=task_log,
                     )
-                    # Guard against runners that hang without raising (e.g. a
-                    # remote sandbox that OOM-killed the kernel and never returns).
-                    # Without this cap a single stuck session would hold its
-                    # concurrency slot forever and stall the whole training batch.
-                    # wait_for only bounds the parent's await; the Ray task must
-                    # be cancelled explicitly or it (and its sandbox) would keep
-                    # running. Graceful cancel first so the runner's asyncio.run
-                    # unwinds and its sandbox context manager tears down cleanly;
-                    # force-kill only if it ignores the cancel.
+                    # The session deadline (_run_agent_episode_with_deadline)
+                    # arrives here as cancellation. It only stops the parent's
+                    # await; the Ray task must be cancelled explicitly or it (and
+                    # its sandbox) would keep running. Graceful cancel first so the
+                    # runner's asyncio.run unwinds and its sandbox context manager
+                    # tears down cleanly; force-kill only if it ignores the cancel.
                     try:
-                        task_result = await asyncio.wait_for(
-                            object_ref,
-                            timeout=runner_config.session_timeout_seconds,
-                        )
-                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                        task_result = await object_ref
+                    except asyncio.CancelledError:
                         await self._cancel_runner_task(object_ref, session_id)
                         raise
                 else:
@@ -931,14 +996,11 @@ class GatewayAgentFramework(AgentFramework):
             except asyncio.CancelledError:
                 # Parent shutdown/cancellation must not leave the Gateway route
                 # and actor-owned session live after the runner task is gone.
-                try:
-                    await asyncio.shield(self.gateway_manager.abort_session(session_id))
-                except Exception:
-                    logger.exception("session %s: Gateway abort failed during parent cancellation", session_id)
+                await self._abort_session(session_id)
                 raise
             except Exception:
                 logger.exception("session %s failed (runner=%s); aborting session", session_id, runner_name)
-                await self.gateway_manager.abort_session(session_id)
+                await self._abort_session(session_id)
                 session_trace.finish(
                     runner_name=runner_name,
                     status="failure",
