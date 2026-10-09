@@ -19,6 +19,7 @@ import numpy as np
 import ray
 import torch
 from omegaconf import OmegaConf
+from ray.exceptions import RayTaskError
 from tensordict import TensorDict
 from tensordict.tensorclass import NonTensorData, NonTensorStack
 
@@ -125,14 +126,22 @@ def _run_agent_runner_ray_task(
     """Run only the user runner in Ray; parent owns session lifecycle outputs."""
     runner = _materialize_runner(runner_fqn, runner_kwargs)
     with _log_scope(log_context):
-        return asyncio.run(
-            runner(
-                raw_prompt=raw_prompt,
-                session=session,
-                sample_index=sample_index,
-                **({"tools_kwargs": tools_kwargs} if tools_kwargs is not None else {}),
+        try:
+            return asyncio.run(
+                runner(
+                    raw_prompt=raw_prompt,
+                    session=session,
+                    sample_index=sample_index,
+                    **({"tools_kwargs": tools_kwargs} if tools_kwargs is not None else {}),
+                )
             )
-        )
+        except asyncio.CancelledError as exc:
+            # ray.cancel arrives as KeyboardInterrupt, so a CancelledError leaving
+            # asyncio.run was raised inside the runner (e.g. a leaked timeout).
+            logger.exception("runner for sample_index=%s was cancelled from inside its event loop", sample_index)
+            raise RuntimeError(
+                f"runner for sample_index={sample_index} was cancelled from inside its event loop"
+            ) from exc
 
 
 def _short_failure_reason(error: BaseException) -> str:
@@ -375,6 +384,8 @@ class GatewayAgentFramework(AgentFramework):
     #: ray.cancel (letting its sandbox context manager tear down) before the
     #: framework escalates to a force-kill.
     _RUNNER_CANCEL_GRACE_SECONDS = 30.0
+    #: Bound on a best-effort TQ tag write/listing made while failing prompts.
+    _TQ_TAG_TIMEOUT_SECONDS = 60.0
     #: Bound on a Gateway ``abort_session`` call made while failing a session.
     _SESSION_ABORT_TIMEOUT_SECONDS = 60.0
     #: How long a timed-out session may spend unwinding (runner cancel, Gateway
@@ -662,12 +673,22 @@ class GatewayAgentFramework(AgentFramework):
 
         target_groups = self._resolve_target_groups(prompts, partition_id)
         if target_groups is None:
-            stats = await self._run_batch_rollouts(
-                prompts,
-                global_steps=global_steps,
-                partition_id=partition_id,
-                num_sessions=num_sessions,
-            )
+            try:
+                stats = await self._run_batch_rollouts(
+                    prompts,
+                    global_steps=global_steps,
+                    partition_id=partition_id,
+                    num_sessions=num_sessions,
+                )
+            except BaseException:
+                # The trainer polls TQ tags and never sees this actor call fail;
+                # an untagged prompt would stall it forever.
+                logger.exception(
+                    "generate_sequences died at global_steps=%s; tagging unresolved prompts as failure",
+                    global_steps,
+                )
+                await self._fail_unresolved_prompts([str(uid) for uid in uids], partition_id)
+                raise
         else:
             stats = await self._run_batch_rollouts_with_cut(
                 prompts,
@@ -755,29 +776,58 @@ class GatewayAgentFramework(AgentFramework):
         # Batch layer: each sample/prompt owns its own group of rollout.n sessions.
         # Prompt tasks are isolated so one prompt failure does not drop the whole batch.
         tasks = []
+        uids = []
         for sample_index in range(len(prompts)):
+            sample_fields = self._extract_sample_fields(prompts=prompts, sample_index=sample_index)
+            uids.append(str(sample_fields.get("uid")))
             tasks.append(
                 self._run_prompt_rollouts(
-                    sample_fields=self._extract_sample_fields(prompts=prompts, sample_index=sample_index),
+                    sample_fields=sample_fields,
                     sample_index=sample_index,
                     global_steps=global_steps,
                     partition_id=partition_id,
                     num_sessions=num_sessions,
                 )
             )
+        # An outer cancellation makes gather itself raise; a CancelledError among
+        # the outcomes was raised from inside one prompt and fails only that prompt.
         outcomes = await asyncio.gather(*tasks, return_exceptions=True)
 
         stats = _new_batch_stats(len(prompts))
-        for outcome in outcomes:
-            if isinstance(outcome, Exception):
+        for uid, outcome in zip(uids, outcomes, strict=True):
+            if isinstance(outcome, Exception | asyncio.CancelledError):
                 _add_failed_prompt(stats, num_sessions, _short_failure_reason(outcome))
+                await self._tag_prompt_failure(uid, partition_id)
                 continue
-            # Propagate control-flow exceptions such as CancelledError/SystemExit;
-            # only ordinary Exceptions are treated as isolated rollout failures.
             if isinstance(outcome, BaseException):
                 raise outcome
             _add_prompt_stats(stats, outcome)
         return stats
+
+    async def _tag_prompt_failure(self, uid: str, partition_id: str) -> None:
+        try:
+            await asyncio.wait_for(
+                tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "failure"}),
+                timeout=self._TQ_TAG_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            logger.exception("failed to tag prompt uid=%s as failure in TQ", uid)
+
+    async def _fail_unresolved_prompts(self, uids: list[str], partition_id: str) -> None:
+        """Tag every prompt of ``uids`` still pending/running in TQ as ``failure``."""
+        try:
+            listing = await asyncio.wait_for(tq.async_kv_list(partition_id), timeout=self._TQ_TAG_TIMEOUT_SECONDS)
+            tags = listing.get(partition_id, {})
+        except Exception:
+            logger.exception(
+                "failed to list TQ partition %s; tagging all %s prompts as failure", partition_id, len(uids)
+            )
+            tags = {}
+        unresolved = [uid for uid in uids if (tags.get(uid) or {}).get("status", "running") in ("pending", "running")]
+        if unresolved:
+            logger.error("tagging %s unresolved prompts as failure: %s", len(unresolved), unresolved[:8])
+        for uid in unresolved:
+            await self._tag_prompt_failure(uid, partition_id)
 
     async def _run_batch_rollouts_with_cut(
         self,
@@ -865,7 +915,9 @@ class GatewayAgentFramework(AgentFramework):
                         continue
                     try:
                         group = task.result()
-                    except Exception as exc:
+                    except (Exception, asyncio.CancelledError) as exc:
+                        # Groups are only cancelled from here after this loop; a
+                        # cancelled group in ``done`` cancelled itself from inside.
                         _add_failed_prompt(stats, num_sessions, _short_failure_reason(exc))
                         failed[index] = _short_failure_reason(exc)
                         continue
@@ -1010,12 +1062,13 @@ class GatewayAgentFramework(AgentFramework):
 
         group = _PromptGroup(uid=uid, num_sessions=num_sessions)
         for session_index, outcome in enumerate(outcomes):
-            if isinstance(outcome, Exception):
+            # An outer cancellation makes gather itself raise; a CancelledError
+            # among the outcomes came from inside that session and fails only it.
+            if isinstance(outcome, Exception | asyncio.CancelledError):
                 group.failed_sessions += 1
                 group.failure_reasons.append(_short_failure_reason(outcome))
                 continue
-            # Propagate control-flow exceptions such as CancelledError/SystemExit;
-            # only ordinary Exceptions are treated as isolated rollout failures.
+            # Propagate other control-flow exceptions such as SystemExit.
             if isinstance(outcome, BaseException):
                 raise outcome
 
@@ -1171,9 +1224,6 @@ class GatewayAgentFramework(AgentFramework):
         """
         timeout = runner_config.session_timeout_seconds
         episode = self._run_agent_episode(runner_config=runner_config, **episode_kwargs)
-        if timeout is None:
-            return await episode
-
         task = asyncio.ensure_future(episode)
         # An abandoned task may still fail later; retrieve it so asyncio does
         # not log "exception was never retrieved".
@@ -1185,6 +1235,13 @@ class GatewayAgentFramework(AgentFramework):
             await asyncio.wait({task}, timeout=self._SESSION_CLEANUP_GRACE_SECONDS)
             raise
         if done:
+            if task.cancelled():
+                # Nobody cancelled this session from outside: a CancelledError
+                # raised inside it is a session failure, not batch cancellation.
+                raise RuntimeError(
+                    f"session (sample_index={episode_kwargs.get('sample_index')} "
+                    f"session_index={episode_kwargs.get('session_index')}) was cancelled from inside"
+                )
             return task.result()
 
         task.cancel()
@@ -1285,6 +1342,13 @@ class GatewayAgentFramework(AgentFramework):
                     # tears down cleanly; force-kill only if it ignores the cancel.
                     try:
                         task_result = await object_ref
+                    except RayTaskError as exc:
+                        # Ray re-raises a runner's CancelledError as a class that
+                        # also subclasses CancelledError; it is a runner failure,
+                        # not cancellation of this session.
+                        if isinstance(exc, asyncio.CancelledError):
+                            raise RuntimeError(f"runner task raised CancelledError: {exc}") from None
+                        raise
                     except asyncio.CancelledError:
                         await self._cancel_runner_task(object_ref, session_id)
                         raise

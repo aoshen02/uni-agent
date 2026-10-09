@@ -279,13 +279,20 @@ class E2BSandbox(Sandbox):
         # command rather than leaving an orphaned child behind.
         command = f"exec {shlex.join(argv)}"
         command_timeout = timeout if timeout is not None and timeout > 0 else 0
-        handle = await self._require_sandbox().commands.run(
-            command,
-            background=True,
-            timeout=command_timeout,
-            user=self.user,
-            envs=env,
-            cwd=workdir,
+        # The SDK opens the stream under ``asyncio.timeout(command_timeout)``
+        # inside an async generator, so that deadline is bound to whichever task
+        # opens the stream, while the handle reads it from its own task. Opened
+        # here, an expiring command timeout would cancel this caller mid-await
+        # with a bare CancelledError; a throwaway task absorbs it instead.
+        handle = await asyncio.ensure_future(
+            self._require_sandbox().commands.run(
+                command,
+                background=True,
+                timeout=command_timeout,
+                user=self.user,
+                envs=env,
+                cwd=workdir,
+            )
         )
         # A sandbox that becomes unreachable can leave wait() hanging forever;
         # bound it past the command's own timeout. Hitting this bound is a broken

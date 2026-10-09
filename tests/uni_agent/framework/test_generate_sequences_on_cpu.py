@@ -418,6 +418,13 @@ class _FakeTransferQueue:
     async def async_kv_clear(self, *, keys, partition_id):
         self.clears.append({"keys": list(keys), "partition_id": partition_id})
 
+    async def async_kv_list(self, partition_id):
+        tags = {}
+        for put in self.puts:
+            if put["partition_id"] == partition_id:
+                tags.setdefault(put["key"], {}).update(put["tag"])
+        return {partition_id: tags}
+
     async def async_kv_batch_put(self, *, keys, fields, tags, partition_id):
         self.batch_puts.append(
             {
@@ -1893,6 +1900,136 @@ async def test_generate_sequences_keeps_other_prompts_when_one_prompt_fails(fake
     assert len(runtime.aborted_sessions) == 1
     assert runtime.aborted_sessions[0].startswith("session-sample-0-rollout-0-")
     assert all(session_id.startswith("session-sample-1-rollout-0-") for session_id in runtime.finalized_sessions)
+
+
+async def _cancelling_runner(**kwargs):
+    raise asyncio.CancelledError()
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+@pytest.mark.parametrize("session_timeout_seconds", [None, 30.0])
+async def test_cancelled_error_inside_one_session_fails_only_that_session(fake_tq, session_timeout_seconds):
+    """Regression: a CancelledError raised inside a session (not an outer cancel)
+    used to propagate out of its group and kill generate_sequences, leaving groups
+    tagged ``running`` forever. It must fail only that session."""
+    runtime = _all_sessions_runtime(num_prompts=2, n=2)
+
+    async def agent_runner(*, session, **kwargs):
+        if session.session_id.startswith("session-sample-0-rollout-1-"):
+            raise asyncio.CancelledError()
+        return TaskResult()
+
+    runner_config = _inline_runner_config(agent_runner)
+    runner_config["session_timeout_seconds"] = session_timeout_seconds
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": runner_config},
+        gateway_manager=runtime,
+        n=2,
+    )
+
+    await asyncio.wait_for(framework.generate_sequences(_build_prompts(count=2, global_steps=13)), timeout=5)
+
+    assert {put["key"]: put["tag"]["status"] for put in fake_tq.puts} == {"uid-0": "finished", "uid-1": "finished"}
+    assert sorted(key for put in fake_tq.batch_puts for key in put["keys"]) == ["uid-0_0_0", "uid-1_0_0", "uid-1_1_0"]
+    assert [s.split("-rollout-")[0] for s in runtime.aborted_sessions] == ["session-sample-0"]
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_ray_runner_cancelled_error_is_a_session_failure_not_a_cancel(monkeypatch, fake_tq):
+    """Ray re-raises a runner's CancelledError as RayTaskError(CancelledError), which
+    is also an asyncio.CancelledError; it must fail the session without ray.cancel."""
+    from ray.exceptions import RayTaskError
+
+    from uni_agent.framework import framework as framework_module
+
+    cancel_calls = []
+
+    class _Ref:
+        def __init__(self, sample_index):
+            self.sample_index = sample_index
+
+        def __await__(self):
+            fut: asyncio.Future = asyncio.get_running_loop().create_future()
+            if self.sample_index == 0:
+                fut.set_exception(RayTaskError("runner", "tb", asyncio.CancelledError()).as_instanceof_cause())
+            else:
+                fut.set_result(TaskResult())
+            return fut.__await__()
+
+    monkeypatch.setattr(
+        framework_module._run_agent_runner_ray_task, "remote", lambda **kwargs: _Ref(kwargs["sample_index"])
+    )
+    monkeypatch.setattr(
+        framework_module, "ray", types.SimpleNamespace(cancel=lambda ref, **kw: cancel_calls.append(ref))
+    )
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={
+            "runner": {
+                "runner_fqn": "tests.uni_agent.support.logging_runner",
+                "dispatch_mode": "ray_task",
+                "session_timeout_seconds": 30.0,
+            }
+        },
+        gateway_manager=_all_sessions_runtime(num_prompts=2, n=1),
+        max_failed_prompt_fraction=0.5,
+    )
+
+    await asyncio.wait_for(framework.generate_sequences(_build_prompts(count=2, global_steps=14)), timeout=5)
+
+    assert cancel_calls == []
+    assert {put["key"]: put["tag"]["status"] for put in fake_tq.puts} == {"uid-0": "failure", "uid-1": "finished"}
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+def test_ray_runner_task_turns_inner_cancelled_error_into_runtime_error():
+    """A CancelledError leaving the runner's asyncio.run was raised inside the
+    runner; the Ray task reports it as an ordinary failure."""
+    from uni_agent.framework.framework import _run_agent_runner_ray_task
+
+    with pytest.raises(RuntimeError, match="cancelled from inside its event loop"):
+        _run_agent_runner_ray_task._function(
+            runner_fqn=f"{__name__}._cancelling_runner",
+            runner_kwargs={},
+            raw_prompt=[],
+            session=None,
+            sample_index=3,
+            tools_kwargs=None,
+            log_context=None,
+        )
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_dying_generate_sequences_tags_unresolved_prompts_as_failure(fake_tq):
+    """The trainer only polls TQ tags, so if generate_sequences dies (here: the
+    actor call is cancelled) every prompt still running must be tagged failure."""
+    release = asyncio.Event()
+
+    async def agent_runner(*, sample_index, **kwargs):
+        if sample_index == 1:
+            await release.wait()
+        return TaskResult()
+
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _inline_runner_config(agent_runner)},
+        gateway_manager=_all_sessions_runtime(num_prompts=2, n=1),
+    )
+    task = asyncio.ensure_future(framework.generate_sequences(_build_prompts(count=2, global_steps=15)))
+    while not any(put["tag"]["status"] == "finished" for put in fake_tq.puts):
+        await asyncio.sleep(0.01)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=5)
+
+    terminal = {put["key"]: put["tag"]["status"] for put in fake_tq.puts}
+    assert terminal == {"uid-0": "finished", "uid-1": "failure"}
 
 
 def _runner_failing_sessions(failing: set[tuple[int, int]]):

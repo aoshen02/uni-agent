@@ -503,6 +503,53 @@ def test_e2b_hung_kill_does_not_hang_exec(monkeypatch):
         asyncio.run(run())
 
 
+@pytest.mark.cpu
+@pytest.mark.level0
+def test_e2b_command_timeout_does_not_cancel_the_caller(monkeypatch):
+    """Regression: the SDK opens the stream under ``asyncio.timeout(timeout)`` in the
+    calling task but reads it from the handle's task, so an expiring command
+    timeout used to cancel the caller of ``_exec`` with a bare CancelledError."""
+    import sys
+
+    from uni_agent.sandbox import e2b
+    from uni_agent.sandbox.e2b import E2BSandbox
+
+    monkeypatch.setitem(sys.modules, "e2b", SimpleNamespace(CommandExitException=_E2BCommandExit))
+    monkeypatch.setattr(e2b, "_EXEC_HARD_TIMEOUT_GRACE", 0.2)
+    monkeypatch.setattr(e2b, "_COMMAND_KILL_TIMEOUT", 0.05)
+
+    class _StreamHandle:
+        def __init__(self, events):
+            self._drain = asyncio.ensure_future(self._consume(events))
+
+        @staticmethod
+        async def _consume(events):
+            async for _ in events:
+                pass
+
+        async def wait(self):
+            return await self._drain
+
+        async def kill(self):
+            self._drain.cancel()
+
+    async def run(command, *, timeout, **kwargs):
+        async def events():
+            async with asyncio.timeout(timeout):
+                yield "start"
+                await asyncio.sleep(3600)
+
+        stream = events()
+        await stream.__anext__()
+        return _StreamHandle(stream)
+
+    sb = E2BSandbox(template="t")
+    sb._sandbox = SimpleNamespace(commands=SimpleNamespace(run=run))
+
+    with pytest.raises(SandboxChannelError):
+        asyncio.run(sb._exec(["sleep", "100"], timeout=0.05))
+
+
 class _FakeAsyncSandbox:
     created: list[dict] = []
 
