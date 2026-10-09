@@ -9,7 +9,7 @@ import time
 import uuid
 from typing import Any
 
-from ...sandbox import SandboxBackend
+from ...sandbox import ExecResult, SandboxBackend
 
 logger = logging.getLogger(__name__)
 
@@ -56,12 +56,49 @@ async def _read_text(sandbox: SandboxBackend, path: str) -> str:
         return ""
 
 
+class EvalInfraError(RuntimeError):
+    """The evaluation could not run, so its result says nothing about the patch."""
+
+
+_PROBE_TIMEOUT_SECONDS = 60.0
+
+
+def _eval_infra_failure(response: ExecResult, execution_time: float, eval_timeout: float) -> str | None:
+    """Why the eval command's result is not a real outcome, or ``None`` if it is."""
+    if response.infra_error:
+        return f"eval command did not complete: {response.infra_error}"
+    # exit -1 is a timeout; one that fires before eval_timeout elapsed came from
+    # the transport, not from the eval's own deadline.
+    if response.exit_code == -1 and execution_time < eval_timeout:
+        return f"eval command timed out after {execution_time:.0f}s, before eval_timeout={eval_timeout:g}s"
+    return None
+
+
+async def _output_missing_reason(sandbox: SandboxBackend, path: str) -> str | None:
+    """``None`` if ``path`` is genuinely absent; otherwise why it could not be read."""
+    probe = await sandbox.exec(["test", "-e", path], timeout=_PROBE_TIMEOUT_SECONDS)
+    if probe.infra_error:
+        return f"sandbox unreachable after eval: {probe.infra_error}"
+    if probe.exit_code == 0:
+        return f"{path} exists but could not be read"
+    if probe.exit_code != 1:
+        return f"probing {path} failed with exit code {probe.exit_code}: {probe.stderr.strip()}"
+    return None
+
+
 async def compute_reward(
     metadata: dict[str, Any],
     sandbox: SandboxBackend,
     eval_timeout: float = 3600.0,
+    raise_on_infra_error: bool = False,
 ) -> dict[str, Any]:
-    """Evaluate the worktree with the official per-instance test scripts."""
+    """Evaluate the worktree with the official per-instance test scripts.
+
+    With ``raise_on_infra_error``, an eval that could not run (sandbox
+    unreachable, hung command stream, output unreadable) raises
+    :class:`EvalInfraError` instead of scoring 0. Test failures and the eval
+    hitting ``eval_timeout`` still score 0.
+    """
     instance_id = metadata["instance_id"]
     selected_tests = _selected_test_args(metadata["selected_test_files_to_run"])
 
@@ -95,6 +132,10 @@ async def compute_reward(
         timeout=eval_timeout,
     )
     execution_time = time.perf_counter() - started
+    if raise_on_infra_error:
+        reason = _eval_infra_failure(response, execution_time, eval_timeout)
+        if reason:
+            raise EvalInfraError(f"SWE-bench Pro eval for {instance_id}: {reason}")
 
     result: dict[str, Any] = {
         "eval_completed": False,
@@ -107,10 +148,17 @@ async def compute_reward(
         },
         "resolved": False,
     }
+    output_read = False
     try:
-        output = json.loads((await sandbox.read_file(paths["output"])).decode("utf-8"))
-        report = _grade(metadata, output)
+        raw_output = await sandbox.read_file(paths["output"])
+        output_read = True
+        report = _grade(metadata, json.loads(raw_output.decode("utf-8")))
     except Exception as exc:
+        # An eval that hit eval_timeout never wrote output; nothing to probe.
+        if raise_on_infra_error and not output_read and response.exit_code != -1:
+            reason = await _output_missing_reason(sandbox, paths["output"])
+            if reason:
+                raise EvalInfraError(f"SWE-bench Pro eval for {instance_id}: {reason}") from exc
         details = [
             response.stderr.strip(),
             response.stdout.strip(),

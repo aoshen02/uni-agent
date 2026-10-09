@@ -70,7 +70,9 @@ class SWEBenchProTaskConfig(TaskConfig):
         default=False,
         description=(
             "Fail the episode instead of scoring it when the agent loop aborted on an exception "
-            "(e.g. the sandbox became unreachable), so RL does not train on infrastructure failures."
+            "(e.g. the sandbox became unreachable) or the evaluation could not run (sandbox unreachable, "
+            "hung command stream, unreadable output), so RL does not train on infrastructure failures. "
+            "Failing tests and hitting eval_timeout still score 0."
         ),
     )
 
@@ -137,6 +139,7 @@ class SWEBenchProTask(Task):
                 sample,
                 sandbox,
                 eval_timeout=cfg.eval_timeout,
+                raise_on_infra_error=cfg.fail_on_agent_error,
             )
 
             logger.info("task done: resolved=%s", result["resolved"])
