@@ -10,7 +10,7 @@ import os
 import random
 from collections.abc import Awaitable, Callable
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from functools import partial
 from pathlib import Path
 from uuid import uuid4
@@ -170,6 +170,54 @@ def _select_session_trajectories(
         len(trajectories),
     )
     return [trajectory]
+
+
+@dataclass
+class _PromptGroup:
+    """One prompt's finished sessions, held in memory until written to TQ."""
+
+    uid: str
+    num_sessions: int
+    completed: list[tuple[int, list[Trajectory], dict[str, object]]] = field(default_factory=list)
+    failed_sessions: int = 0
+    failure_reasons: list[str] = field(default_factory=list)
+    dropped_sessions: int = 0
+    drop_reason: str | None = None
+
+
+def _new_batch_stats(num_input_prompts: int) -> dict:
+    return {
+        "num_input_prompts": num_input_prompts,
+        "num_success_sessions": 0,
+        "num_failed_sessions": 0,
+        "num_success_outputs": 0,
+        "num_unfinished_episodes": 0,
+        "num_failed_uids": 0,
+        "num_dropped_uids": 0,
+        "num_dropped_sessions": 0,
+        "num_cut_groups": 0,
+        "failure_reasons": [],
+    }
+
+
+def _add_failed_prompt(stats: dict, num_sessions: int, reason: str) -> None:
+    stats["num_failed_sessions"] += num_sessions
+    stats["num_failed_uids"] += 1
+    stats["failure_reasons"].append(reason)
+
+
+def _add_prompt_stats(stats: dict, outcome: dict) -> None:
+    for key in (
+        "num_success_sessions",
+        "num_failed_sessions",
+        "num_success_outputs",
+        "num_unfinished_episodes",
+        "num_failed_uids",
+        "num_dropped_uids",
+        "num_dropped_sessions",
+    ):
+        stats[key] += outcome[key]
+    stats["failure_reasons"].extend(outcome["failure_reasons"])
 
 
 _TQ_NESTED_SEQUENCE_FIELDS = {
@@ -332,6 +380,13 @@ class GatewayAgentFramework(AgentFramework):
     #: How long a timed-out session may spend unwinding (runner cancel, Gateway
     #: abort) before the framework stops waiting for it.
     _SESSION_CLEANUP_GRACE_SECONDS = 120.0
+    #: Bound on waiting for groups cut by over-provisioning to tear down their
+    #: sessions; covers the per-session cleanup grace above.
+    _CUT_UNWIND_TIMEOUT_SECONDS = 300.0
+    #: How long ``pop_rollout_metrics`` waits for a step's metrics to be published.
+    _METRICS_PUBLISH_TIMEOUT_SECONDS = 120.0
+    #: Over-provisioned steps whose metrics nobody claimed are dropped past this count.
+    _MAX_UNCLAIMED_STEP_METRICS = 8
 
     def __init__(
         self,
@@ -347,6 +402,7 @@ class GatewayAgentFramework(AgentFramework):
         max_failed_prompt_fraction: float = 1.0,
         max_failed_session_fraction: float = 1.0,
         min_group_size: int = 1,
+        over_provision_groups: int = 0,
         trajectory_postprocessor: TrajectoryPostprocessor | None = None,
         trajectory_postprocessor_kwargs: dict[str, object] | None = None,
     ):
@@ -372,6 +428,8 @@ class GatewayAgentFramework(AgentFramework):
         self._max_failed_prompt_fraction = max_failed_prompt_fraction
         self._max_failed_session_fraction = max_failed_session_fraction
         self._min_group_size = min_group_size
+        self._over_provision_groups = over_provision_groups
+        self._step_metrics: dict[int | None, tuple[asyncio.Event, dict[str, float]]] = {}
         self._trajectory_postprocessor = trajectory_postprocessor
         self._trajectory_postprocessor_kwargs = trajectory_postprocessor_kwargs or {}
         for runner_name, runner_config in runner_registry.items():
@@ -443,6 +501,12 @@ class GatewayAgentFramework(AgentFramework):
                 "actor_rollout_ref.rollout.custom.agent_framework.min_group_size must be a positive integer"
             )
 
+        over_provision_groups = af_cfg.get("over_provision_groups", 0)
+        if type(over_provision_groups) is not int or over_provision_groups < 0:
+            raise ValueError(
+                "actor_rollout_ref.rollout.custom.agent_framework.over_provision_groups must be a non-negative integer"
+            )
+
         postprocessor_fqn = af_cfg.get("trajectory_postprocessor_fqn")
         postprocessor_kwargs = af_cfg.get("trajectory_postprocessor_kwargs")
         if postprocessor_kwargs is None:
@@ -481,6 +545,7 @@ class GatewayAgentFramework(AgentFramework):
             max_failed_prompt_fraction=max_failed_prompt_fraction,
             max_failed_session_fraction=max_failed_session_fraction,
             min_group_size=min_group_size,
+            over_provision_groups=over_provision_groups,
             trajectory_postprocessor=trajectory_postprocessor,
             trajectory_postprocessor_kwargs=trajectory_postprocessor_kwargs,
         )
@@ -543,6 +608,37 @@ class GatewayAgentFramework(AgentFramework):
             sampling_params.update(temperature=0, top_p=1.0, top_k=-1)
         return sampling_params
 
+    def _resolve_target_groups(self, prompts: TensorDict, partition_id: str) -> int | None:
+        """Return how many groups to keep from an over-provisioned training batch, or None.
+
+        A trainer that over-provisions stamps ``__target_groups__`` on the batch; that
+        wins over ``over_provision_groups`` so the two sides cannot disagree on the
+        number of terminal groups the trainer waits for.
+        """
+        if partition_id != "train":
+            return None
+        num_prompts = len(prompts)
+        stamped = tu.get(prompts, "__target_groups__")
+        if stamped is not None:
+            target_groups = int(stamped)
+            if self._over_provision_groups and num_prompts - self._over_provision_groups != target_groups:
+                logger.warning(
+                    "batch stamps __target_groups__=%s for %s prompts; ignoring over_provision_groups=%s",
+                    target_groups,
+                    num_prompts,
+                    self._over_provision_groups,
+                )
+        elif self._over_provision_groups:
+            target_groups = num_prompts - self._over_provision_groups
+        else:
+            return None
+        if target_groups < 1:
+            raise ValueError(
+                f"over-provisioned batch of {num_prompts} prompts leaves target_groups={target_groups}; "
+                "need at least one group to keep"
+            )
+        return target_groups if target_groups < num_prompts else None
+
     async def generate_sequences(self, prompts: TensorDict) -> None:
         """Run rollout-manager generation and write outputs into TransferQueue."""
         if self._rollout_config is None:
@@ -564,16 +660,26 @@ class GatewayAgentFramework(AgentFramework):
         if uids is None:
             raise ValueError("GatewayAgentFramework requires prompts['uid'] for TransferQueue output")
 
-        stats = await self._run_batch_rollouts(
-            prompts,
-            global_steps=global_steps,
-            partition_id=partition_id,
-            num_sessions=num_sessions,
-        )
+        target_groups = self._resolve_target_groups(prompts, partition_id)
+        if target_groups is None:
+            stats = await self._run_batch_rollouts(
+                prompts,
+                global_steps=global_steps,
+                partition_id=partition_id,
+                num_sessions=num_sessions,
+            )
+        else:
+            stats = await self._run_batch_rollouts_with_cut(
+                prompts,
+                global_steps=global_steps,
+                partition_id=partition_id,
+                num_sessions=num_sessions,
+                target_groups=target_groups,
+            )
         logger.info(
             "generate_sequences summary: num_input_prompts=%s num_success_sessions=%s "
             "num_failed_sessions=%s num_success_outputs=%s num_unfinished_episodes=%s "
-            "num_failed_uids=%s num_dropped_uids=%s num_dropped_sessions=%s failure_reasons=%s",
+            "num_failed_uids=%s num_dropped_uids=%s num_dropped_sessions=%s num_cut_groups=%s failure_reasons=%s",
             stats["num_input_prompts"],
             stats["num_success_sessions"],
             stats["num_failed_sessions"],
@@ -582,6 +688,7 @@ class GatewayAgentFramework(AgentFramework):
             stats["num_failed_uids"],
             stats["num_dropped_uids"],
             stats["num_dropped_sessions"],
+            stats["num_cut_groups"],
             stats["failure_reasons"][:3],
         )
         if stats["num_success_outputs"] == 0:
@@ -589,18 +696,21 @@ class GatewayAgentFramework(AgentFramework):
                 f"All rollouts failed at global_steps={global_steps}. "
                 f"failures={stats['num_failed_uids']}/{stats['num_input_prompts']}"
             )
+        # Groups cut by over-provisioning never finished, so they are neither
+        # failures nor part of the denominator of the failure guards below.
+        num_resolved_prompts = stats["num_input_prompts"] - stats["num_cut_groups"]
         # Failed prompts are dropped from the batch; past this fraction the step
         # would silently train on a different batch than configured.
-        if stats["num_failed_uids"] > self._max_failed_prompt_fraction * stats["num_input_prompts"]:
+        if stats["num_failed_uids"] > self._max_failed_prompt_fraction * num_resolved_prompts:
             raise RuntimeError(
                 f"Too many failed prompts at global_steps={global_steps}: "
-                f"{stats['num_failed_uids']}/{stats['num_input_prompts']} > "
+                f"{stats['num_failed_uids']}/{num_resolved_prompts} > "
                 f"max_failed_prompt_fraction={self._max_failed_prompt_fraction}; "
                 f"reasons={stats['failure_reasons'][:3]}"
             )
         # Partial session loss keeps every prompt alive but shrinks groups, which
         # the prompt guard above cannot see.
-        num_planned_sessions = stats["num_input_prompts"] * num_sessions
+        num_planned_sessions = num_resolved_prompts * num_sessions
         if stats["num_failed_sessions"] > self._max_failed_session_fraction * num_planned_sessions:
             raise RuntimeError(
                 f"Too many failed sessions at global_steps={global_steps}: "
@@ -609,6 +719,25 @@ class GatewayAgentFramework(AgentFramework):
                 f"reasons={stats['failure_reasons'][:3]}"
             )
         return None
+
+    async def pop_rollout_metrics(self, global_steps: int | None) -> dict[str, float]:
+        """Return (once) the rollout metrics of an over-provisioned training step.
+
+        The trainer calls this right after sampling the step's batch. It can sample as
+        soon as the last kept group is tagged, a moment before the metrics are published;
+        the bounded wait covers that gap. Steps that were not over-provisioned have no
+        metrics and return ``{}``.
+        """
+        entry = self._step_metrics.get(global_steps)
+        if entry is None:
+            return {}
+        published, metrics = entry
+        try:
+            await asyncio.wait_for(published.wait(), timeout=self._METRICS_PUBLISH_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            logger.warning("rollout metrics for global_steps=%s were not published in time", global_steps)
+        self._step_metrics.pop(global_steps, None)
+        return dict(metrics)
 
     async def _run_batch_rollouts(
         self,
@@ -638,37 +767,193 @@ class GatewayAgentFramework(AgentFramework):
             )
         outcomes = await asyncio.gather(*tasks, return_exceptions=True)
 
-        failure_reasons: list[str] = []
-        stats = {
-            "num_input_prompts": len(prompts),
-            "num_success_sessions": 0,
-            "num_failed_sessions": 0,
-            "num_success_outputs": 0,
-            "num_unfinished_episodes": 0,
-            "num_failed_uids": 0,
-            "num_dropped_uids": 0,
-            "num_dropped_sessions": 0,
-            "failure_reasons": failure_reasons,
-        }
+        stats = _new_batch_stats(len(prompts))
         for outcome in outcomes:
             if isinstance(outcome, Exception):
-                stats["num_failed_sessions"] += num_sessions
-                stats["num_failed_uids"] += 1
-                failure_reasons.append(_short_failure_reason(outcome))
+                _add_failed_prompt(stats, num_sessions, _short_failure_reason(outcome))
                 continue
             # Propagate control-flow exceptions such as CancelledError/SystemExit;
             # only ordinary Exceptions are treated as isolated rollout failures.
             if isinstance(outcome, BaseException):
                 raise outcome
-            stats["num_success_sessions"] += outcome["num_success_sessions"]
-            stats["num_failed_sessions"] += outcome["num_failed_sessions"]
-            stats["num_success_outputs"] += outcome["num_success_outputs"]
-            stats["num_unfinished_episodes"] += outcome["num_unfinished_episodes"]
-            stats["num_failed_uids"] += outcome["num_failed_uids"]
-            stats["num_dropped_uids"] += outcome["num_dropped_uids"]
-            stats["num_dropped_sessions"] += outcome["num_dropped_sessions"]
-            failure_reasons.extend(outcome["failure_reasons"])
+            _add_prompt_stats(stats, outcome)
         return stats
+
+    async def _run_batch_rollouts_with_cut(
+        self,
+        prompts: TensorDict,
+        *,
+        global_steps: int | None,
+        partition_id: str,
+        num_sessions: int,
+        target_groups: int,
+    ) -> dict:
+        """Run an over-provisioned batch and keep the first ``target_groups`` groups to finish.
+
+        Once ``target_groups`` groups have finished (at least ``min_group_size``
+        sessions survived and reached TQ), every group still in flight is cut: its
+        sessions are cancelled, which cancels their runner Ray tasks, aborts their
+        Gateway sessions and tears down their sandboxes. Kept groups are written to
+        TQ in prompt order, not completion order.
+
+        The trainer waits for exactly ``target_groups`` terminal groups, so this
+        writes exactly that many terminal tags: kept groups are ``finished``; if
+        fewer than ``target_groups`` groups could finish, failed groups fill the
+        rest as ``failure`` (the ordinary failed-prompt path). Every other group's
+        prompt key is cleared from TQ, so it never reaches this or a later step.
+        """
+        num_prompts = len(prompts)
+        assert 0 < target_groups < num_prompts
+        if num_sessions <= 0:
+            raise ValueError(f"num_sessions must be positive, got {num_sessions}")
+        published = asyncio.Event()
+        metrics: dict[str, float] = {}
+        self._step_metrics[global_steps] = (published, metrics)
+        while len(self._step_metrics) > self._MAX_UNCLAIMED_STEP_METRICS:
+            self._step_metrics.pop(next(iter(self._step_metrics)))
+
+        uids: list[str] = []
+        pending: dict[asyncio.Future, int] = {}
+        for sample_index in range(num_prompts):
+            sample_fields = self._extract_sample_fields(prompts=prompts, sample_index=sample_index)
+            uids.append(str(sample_fields.get("uid")))
+            task = asyncio.ensure_future(
+                self._run_prompt_sessions(
+                    sample_fields=sample_fields,
+                    sample_index=sample_index,
+                    global_steps=global_steps,
+                    partition_id=partition_id,
+                    num_sessions=num_sessions,
+                )
+            )
+            pending[task] = sample_index
+
+        stats = _new_batch_stats(num_prompts)
+        held: dict[int, _PromptGroup] = {}  # finished, waiting for every lower index to resolve
+        kept: list[int] = []
+        failed: dict[int, str] = {}
+        cut: dict[int, str] = {}
+        next_to_write = 0
+
+        async def write_resolved_prefix() -> None:
+            # Writing a group only once every lower prompt index has resolved keeps
+            # TQ insertion in prompt order while still streaming most writes.
+            nonlocal next_to_write
+            while next_to_write < num_prompts:
+                index = next_to_write
+                if index in held:
+                    outcome = await self._write_prompt_group(
+                        held.pop(index), global_steps=global_steps, partition_id=partition_id, tag_failure=False
+                    )
+                    _add_prompt_stats(stats, outcome)
+                    if outcome["num_success_sessions"] > 0:
+                        kept.append(index)
+                    else:
+                        failed[index] = "every TQ write failed"
+                elif index not in failed and index not in cut:
+                    return
+                next_to_write += 1
+
+        cut_tasks: list[asyncio.Future] = []
+        try:
+            while pending and len(kept) + len(held) < target_groups:
+                done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                for task in sorted(done, key=pending.__getitem__):
+                    index = pending.pop(task)
+                    if len(kept) + len(held) >= target_groups:
+                        cut[index] = "finished after target_groups was reached"
+                        continue
+                    try:
+                        group = task.result()
+                    except Exception as exc:
+                        _add_failed_prompt(stats, num_sessions, _short_failure_reason(exc))
+                        failed[index] = _short_failure_reason(exc)
+                        continue
+                    if group.completed:
+                        held[index] = group
+                    else:
+                        _add_prompt_stats(
+                            stats,
+                            await self._write_prompt_group(
+                                group, global_steps=global_steps, partition_id=partition_id, tag_failure=False
+                            ),
+                        )
+                        failed[index] = group.drop_reason or "every session failed"
+                await write_resolved_prefix()
+
+            for task, index in pending.items():
+                cut[index] = "in flight when target_groups was reached"
+                task.cancel()
+            cut_tasks.extend(pending)
+            pending.clear()
+            await write_resolved_prefix()
+            assert not held and next_to_write == num_prompts
+
+            # Fill up to target_groups terminal groups with failures, lowest prompt
+            # index first, exactly as a non-over-provisioned batch would report them.
+            failure_tagged = sorted(failed)[: max(0, target_groups - len(kept))]
+            unused_failed = sorted(set(failed) - set(failure_tagged))
+            await self._clear_prompt_keys([uids[index] for index in unused_failed], partition_id)
+            stats["num_cut_groups"] = len(cut)
+            metrics.update(
+                {
+                    "rollout/groups_launched": num_prompts,
+                    "rollout/groups_target": target_groups,
+                    "rollout/groups_kept": len(kept),
+                    "rollout/groups_cut": len(cut),
+                    "rollout/groups_failed": len(failed),
+                    "rollout/sessions_failed": stats["num_failed_sessions"],
+                }
+            )
+            published.set()
+            for index in failure_tagged:
+                await tq.async_kv_put(key=uids[index], partition_id=partition_id, tag={"status": "failure"})
+            logger.info(
+                "over-provision cut at global_steps=%s: kept %s/%s groups (target %s) in prompt order %s; "
+                "cut %s; failed %s; failed groups reported as failure %s",
+                global_steps,
+                len(kept),
+                num_prompts,
+                target_groups,
+                kept,
+                [(index, uids[index], reason) for index, reason in sorted(cut.items())],
+                [(index, uids[index], reason) for index, reason in sorted(failed.items())],
+                failure_tagged,
+            )
+        except BaseException:
+            for task in pending:
+                task.cancel()
+            cut_tasks.extend(pending)
+            raise
+        finally:
+            published.set()
+            await self._await_cut_groups(cut_tasks)
+            await self._clear_prompt_keys([uids[index] for index in sorted(cut)], partition_id)
+        return stats
+
+    async def _await_cut_groups(self, tasks: list[asyncio.Future]) -> None:
+        """Wait (bounded) for cancelled groups to tear down their sessions and sandboxes."""
+        if not tasks:
+            return
+        _, still_running = await asyncio.wait(tasks, timeout=self._CUT_UNWIND_TIMEOUT_SECONDS)
+        for task in tasks:
+            if task.done() and not task.cancelled():
+                task.exception()  # retrieved so asyncio does not log it as never retrieved
+        if still_running:
+            logger.error(
+                "%s cut prompt groups did not unwind within %ss; abandoning them",
+                len(still_running),
+                self._CUT_UNWIND_TIMEOUT_SECONDS,
+            )
+
+    async def _clear_prompt_keys(self, uids: list[str], partition_id: str) -> None:
+        """Drop prompt keys that will never reach a terminal status, so no later step sees them."""
+        if not uids:
+            return
+        try:
+            await tq.async_kv_clear(keys=uids, partition_id=partition_id)
+        except Exception:
+            logger.exception("failed to clear %s cut/unused prompt keys from TQ: %s", len(uids), uids[:8])
 
     async def _run_prompt_rollouts(
         self,
@@ -680,6 +965,25 @@ class GatewayAgentFramework(AgentFramework):
         num_sessions: int,
     ) -> dict:
         """Run ``rollout.n`` independent sessions for one prompt and persist their outputs."""
+        group = await self._run_prompt_sessions(
+            sample_fields=sample_fields,
+            sample_index=sample_index,
+            global_steps=global_steps,
+            partition_id=partition_id,
+            num_sessions=num_sessions,
+        )
+        return await self._write_prompt_group(group, global_steps=global_steps, partition_id=partition_id)
+
+    async def _run_prompt_sessions(
+        self,
+        *,
+        sample_fields: dict[str, object],
+        sample_index: int,
+        global_steps: int | None,
+        partition_id: str,
+        num_sessions: int,
+    ) -> _PromptGroup:
+        """Run ``rollout.n`` sessions for one prompt and apply the group-size guard; no TQ writes."""
         uid = sample_fields.get("uid")
         if uid is None:
             raise ValueError("GatewayAgentFramework requires prompts['uid'] for TransferQueue output")
@@ -704,16 +1008,11 @@ class GatewayAgentFramework(AgentFramework):
         ]
         outcomes = await asyncio.gather(*tasks, return_exceptions=True)
 
-        success_sessions = 0
-        failed_sessions = 0
-        success_outputs = 0
-        unfinished_episodes = 0
-        failure_reasons: list[str] = []
-        completed: list[tuple[int, list[Trajectory], dict[str, object]]] = []
+        group = _PromptGroup(uid=uid, num_sessions=num_sessions)
         for session_index, outcome in enumerate(outcomes):
             if isinstance(outcome, Exception):
-                failed_sessions += 1
-                failure_reasons.append(_short_failure_reason(outcome))
+                group.failed_sessions += 1
+                group.failure_reasons.append(_short_failure_reason(outcome))
                 continue
             # Propagate control-flow exceptions such as CancelledError/SystemExit;
             # only ordinary Exceptions are treated as isolated rollout failures.
@@ -722,26 +1021,41 @@ class GatewayAgentFramework(AgentFramework):
 
             trajectories, session_sample_fields = outcome
             if not trajectories:
-                failed_sessions += 1
-                failure_reasons.append(f"empty trajectories for uid={uid} session_index={session_index}")
+                group.failed_sessions += 1
+                group.failure_reasons.append(f"empty trajectories for uid={uid} session_index={session_index}")
                 continue
-            completed.append((session_index, trajectories, session_sample_fields))
+            group.completed.append((session_index, trajectories, session_sample_fields))
 
         # A group shrunk by failures gives GRPO a high-variance baseline that is
         # biased toward whatever outcome survives failures; drop it instead.
         min_group_size = min(self._min_group_size, num_sessions) if partition_id == "train" else 1
-        dropped_sessions = 0
-        if 0 < len(completed) < min_group_size:
-            dropped_sessions = len(completed)
-            reason = (
-                f"group uid={uid} dropped: {len(completed)}/{num_sessions} sessions survived "
+        if 0 < len(group.completed) < min_group_size:
+            group.dropped_sessions = len(group.completed)
+            group.drop_reason = (
+                f"group uid={uid} dropped: {len(group.completed)}/{num_sessions} sessions survived "
                 f"< min_group_size={min_group_size}"
             )
-            logger.warning(reason)
-            failure_reasons.append(reason)
-            completed = []
+            logger.warning(group.drop_reason)
+            group.failure_reasons.append(group.drop_reason)
+            group.completed = []
+        return group
 
-        for session_index, trajectories, session_sample_fields in completed:
+    async def _write_prompt_group(
+        self,
+        group: _PromptGroup,
+        *,
+        global_steps: int | None,
+        partition_id: str,
+        tag_failure: bool = True,
+    ) -> dict:
+        """Write a group's surviving sessions to TQ and tag the prompt finished (or failure)."""
+        uid = group.uid
+        failed_sessions = group.failed_sessions
+        failure_reasons = list(group.failure_reasons)
+        success_sessions = 0
+        success_outputs = 0
+        unfinished_episodes = 0
+        for session_index, trajectories, session_sample_fields in group.completed:
             try:
                 await self._write_session_trajectories_to_tq(
                     uid=uid,
@@ -767,7 +1081,8 @@ class GatewayAgentFramework(AgentFramework):
             await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "finished"})
             failed_uids = 0
         else:
-            await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "failure"})
+            if tag_failure:
+                await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "failure"})
             failed_uids = 1
 
         return {
@@ -776,8 +1091,8 @@ class GatewayAgentFramework(AgentFramework):
             "num_success_outputs": success_outputs,
             "num_unfinished_episodes": unfinished_episodes,
             "num_failed_uids": failed_uids,
-            "num_dropped_uids": int(dropped_sessions > 0),
-            "num_dropped_sessions": dropped_sessions,
+            "num_dropped_uids": int(group.dropped_sessions > 0),
+            "num_dropped_sessions": group.dropped_sessions,
             "failure_reasons": failure_reasons,
         }
 
