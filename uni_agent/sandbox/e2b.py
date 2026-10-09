@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import inspect
 import logging
+import os
 import re
 import shlex
 import threading
@@ -41,6 +42,8 @@ _DEFAULT_CAPACITY_WAIT = 1800.0
 # are expected to return in seconds; override with E2B_EXEC_HARD_TIMEOUT.
 _DEFAULT_EXEC_HARD_TIMEOUT = 600.0
 _EXEC_HARD_TIMEOUT_GRACE = 60.0
+# Bound on the best-effort kill of a command whose stream already failed.
+_COMMAND_KILL_TIMEOUT = 30.0
 _TRANSIENT_STATUS = re.compile(r"^(429|500|502|503|504):")
 _TRANSIENT_EXCEPTIONS = frozenset({"ServiceBusyException", "RateLimitException"})
 
@@ -96,9 +99,12 @@ class E2BSandbox(Sandbox):
         network: dict[str, Any] | None = None,
         lifecycle: dict[str, Any] | None = None,
         file_request_timeout: float = 600.0,
+        lease_seconds: float | None = None,
     ) -> None:
         if runtime_timeout <= 0:
             raise ValueError("runtime_timeout must be positive")
+        if lease_seconds is not None and lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive when provided")
         if file_request_timeout <= 0:
             raise ValueError("file_request_timeout must be positive")
         if cpu_count < 1:
@@ -119,15 +125,24 @@ class E2BSandbox(Sandbox):
         self.runtime_timeout = float(runtime_timeout)
         self.user = user
         self.metadata = dict(metadata or {})
+        # Lets a job-level reaper find this job's sandboxes after a hard cancel.
+        if os.environ.get("SLURM_JOB_ID"):
+            self.metadata.setdefault("slurm_job_id", os.environ["SLURM_JOB_ID"])
         self.envs = dict(envs or {})
         self.secure = secure
         self.allow_internet_access = allow_internet_access
         self.network = network
         self.lifecycle = lifecycle
         self.file_request_timeout = float(file_request_timeout)
+        # With a lease the sandbox is created with a short E2B timeout that a
+        # keepalive task renews (up to runtime_timeout). If this process dies
+        # without stop() (SIGKILL, job cancel, forced ray.cancel) the sandbox
+        # expires after one lease instead of living out runtime_timeout.
+        self.lease_seconds = None if lease_seconds is None else float(lease_seconds)
 
         self._sandbox: Any | None = None
         self.sandbox_id: str | None = None
+        self._keepalive_task: asyncio.Task | None = None
 
     @classmethod
     def from_config(cls, config: SandboxConfig) -> E2BSandbox:
@@ -168,9 +183,10 @@ class E2BSandbox(Sandbox):
             except Exception as exc:
                 await backoff(exc)
 
+        use_lease = self.lease_seconds is not None and self.lease_seconds < self.runtime_timeout
         create_kwargs: dict[str, Any] = {
             "template": template,
-            "timeout": int(self.runtime_timeout),
+            "timeout": int(self.lease_seconds if use_lease else self.runtime_timeout),
             "metadata": self.metadata,
             "envs": self.envs,
             "secure": self.secure,
@@ -189,6 +205,9 @@ class E2BSandbox(Sandbox):
                 await backoff(exc)
         self._sandbox = sandbox
         self.sandbox_id = str(sandbox.sandbox_id)
+        logger.info("E2B sandbox %s started (template=%s metadata=%s)", self.sandbox_id, template, self.metadata)
+        if use_lease:
+            self._keepalive_task = asyncio.create_task(self._keep_alive(sandbox, loop.time() + self.runtime_timeout))
         await sandbox.files.write(
             _RESTORE_IMAGE_PATH_FILE,
             _RESTORE_IMAGE_PATH,
@@ -196,7 +215,30 @@ class E2BSandbox(Sandbox):
             request_timeout=self.file_request_timeout,
         )
 
+    async def _keep_alive(self, sandbox: Any, deadline: float) -> None:
+        """Renew the sandbox lease until ``deadline`` (start + runtime_timeout)."""
+        assert self.lease_seconds is not None
+        loop = asyncio.get_running_loop()
+        interval = max(1.0, self.lease_seconds / 3)
+        while True:
+            await asyncio.sleep(interval)
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return
+            try:
+                await asyncio.wait_for(
+                    sandbox.set_timeout(max(1, int(min(self.lease_seconds, remaining)))),
+                    timeout=interval,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("E2B sandbox %s: lease renewal failed: %r", self.sandbox_id, exc)
+
     async def stop(self) -> None:
+        keepalive, self._keepalive_task = self._keepalive_task, None
+        if keepalive is not None:
+            keepalive.cancel()
         sandbox, self._sandbox = self._sandbox, None
         sandbox_id, self.sandbox_id = self.sandbox_id, None
         if sandbox is None:
@@ -255,6 +297,8 @@ class E2BSandbox(Sandbox):
         else:
             hard_timeout = _env_number("E2B_EXEC_HARD_TIMEOUT", _DEFAULT_EXEC_HARD_TIMEOUT)
         wait_task = asyncio.ensure_future(handle.wait())
+        # On the hung-stream path the task is abandoned and may still fail later.
+        wait_task.add_done_callback(lambda t: t.cancelled() or t.exception())
         try:
             done, _ = await asyncio.wait({wait_task}, timeout=hard_timeout if hard_timeout > 0 else None)
             if not done:
@@ -271,8 +315,9 @@ class E2BSandbox(Sandbox):
             )
         except BaseException:
             wait_task.cancel()
+            # The channel that just failed may also hang the kill RPC.
             try:
-                await asyncio.shield(handle.kill())
+                await asyncio.wait_for(asyncio.shield(handle.kill()), timeout=_COMMAND_KILL_TIMEOUT)
             except Exception:
                 logger.warning("Failed to kill E2B command in sandbox %s", self.sandbox_id)
             raise

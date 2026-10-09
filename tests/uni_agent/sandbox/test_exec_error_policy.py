@@ -484,6 +484,84 @@ def test_e2b_hung_stream_raises_channel_error_and_kills(monkeypatch, timeout):
 
 @pytest.mark.cpu
 @pytest.mark.level0
+def test_e2b_hung_kill_does_not_hang_exec(monkeypatch):
+    """When the channel is broken the kill RPC can hang too; exec must still fail fast."""
+    from uni_agent.sandbox import e2b
+
+    class _HungKillHandle(_HungHandle):
+        async def kill(self):
+            await asyncio.sleep(3600)
+
+    monkeypatch.setattr(e2b, "_COMMAND_KILL_TIMEOUT", 0.05)
+    monkeypatch.setenv("E2B_EXEC_HARD_TIMEOUT", "0.05")
+    sb = _e2b_with_handle(monkeypatch, _HungKillHandle())
+
+    async def run():
+        return await asyncio.wait_for(sb._exec(["tmux", "ls"]), timeout=5)
+
+    with pytest.raises(SandboxChannelError):
+        asyncio.run(run())
+
+
+class _FakeAsyncSandbox:
+    created: list[dict] = []
+
+    def __init__(self):
+        self.sandbox_id = "sbx-1"
+        self.timeouts: list[int] = []
+        self.killed = False
+        self.files = SimpleNamespace(write=self._write)
+
+    async def _write(self, *args, **kwargs):
+        pass
+
+    @classmethod
+    async def create(cls, **kwargs):
+        cls.created.append(kwargs)
+        cls.last = cls()
+        return cls.last
+
+    async def set_timeout(self, timeout):
+        self.timeouts.append(timeout)
+
+    async def kill(self):
+        self.killed = True
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+def test_e2b_lease_is_renewed_while_alive_and_stops_with_sandbox(monkeypatch):
+    """With lease_seconds the sandbox is created with a short E2B timeout and a
+    keepalive renews it, so a process that dies without stop() leaks the sandbox
+    for one lease, not for runtime_timeout."""
+    import sys
+
+    from uni_agent.sandbox.e2b import E2BSandbox
+
+    monkeypatch.setitem(sys.modules, "e2b", SimpleNamespace(AsyncSandbox=_FakeAsyncSandbox))
+    monkeypatch.setenv("SLURM_JOB_ID", "4242")
+    _FakeAsyncSandbox.created = []
+    sb = E2BSandbox(template="t", runtime_timeout=7200, lease_seconds=3)
+
+    async def run():
+        await sb.start()
+        await asyncio.sleep(1.3)
+        await sb.stop()
+        renewals = list(_FakeAsyncSandbox.last.timeouts)
+        await asyncio.sleep(1.2)
+        return renewals
+
+    renewals = asyncio.run(run())
+    created = _FakeAsyncSandbox.created[0]
+    assert created["timeout"] == 3
+    assert created["metadata"]["slurm_job_id"] == "4242"
+    assert renewals == [3]
+    assert _FakeAsyncSandbox.last.timeouts == [3], "keepalive must stop with the sandbox"
+    assert _FakeAsyncSandbox.last.killed
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
 @pytest.mark.parametrize(
     ("exc", "transient"),
     [
